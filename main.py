@@ -106,8 +106,6 @@ class AnalysisResponse(BaseModel):
 def resolve_project_path(path_str: str) -> Path:
     """
     Resolve project path to absolute path.
-    Production: /tmp/uploads/projects/extracted/
-    Development: PROJECT_BASE_PATH/uploads/projects/extracted/
     """
     logger.info(f"Original path: {path_str}")
     
@@ -115,18 +113,22 @@ def resolve_project_path(path_str: str) -> Path:
     
     # Production environment (Render)
     if os.getenv("ENV") == "production":
-        base_path = Path("/tmp")
-        resolved_path = base_path / path
-        logger.info(f"Production - checking: {resolved_path}")
+        # Try multiple path variations
+        possible_paths = [
+            Path("/tmp") / path,
+            Path("/tmp/uploads/projects/extracted") / path,
+            Path("/tmp") / "uploads" / "projects" / "extracted" / path
+        ]
         
-        if resolved_path.exists():
-            return resolved_path
-        else:
-            raise FileNotFoundError(
-                f"Project not found on server: {path_str}\n"
-                f"Checked: {resolved_path}\n"
-                f"Note: Files may have been deleted after service restart (ephemeral storage)"
-            )
+        for resolved_path in possible_paths:
+            logger.info(f"Checking: {resolved_path}")
+            if resolved_path.exists():
+                logger.info(f"Found at: {resolved_path}")
+                return resolved_path
+        
+        raise FileNotFoundError(
+            f"Project not found. Tried paths: {[str(p) for p in possible_paths]}"
+        )
     
     # Development environment (local)
     if PROJECT_BASE_PATH:
