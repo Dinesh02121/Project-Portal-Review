@@ -54,7 +54,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Configure base path for projects (CHANGE THIS TO YOUR ACTUAL PATH)
+
 # Configure base path based on environment
 env = os.getenv("ENV", "development")
 if env == "production":
@@ -86,10 +86,17 @@ else:
 # Simple in-memory cache
 analysis_cache = {}
 
+# ==================== MODELS ====================
+
 class AnalysisRequest(BaseModel):
     project_path: str
     project_name: str
     student_description: str
+
+class AnalysisRequestWithContent(BaseModel):
+    project_name: str
+    student_description: str
+    files_content: Dict[str, str]  # filename -> content mapping
 
 class AnalysisResponse(BaseModel):
     project_name: str
@@ -103,74 +110,107 @@ class AnalysisResponse(BaseModel):
     weaknesses: List[str]
     analysis_timestamp: str
 
-def resolve_project_path(path_str: str) -> Path:
-    """
-    Resolve project path to absolute path.
-    """
-    logger.info(f"Original path: {path_str}")
-    
-    path = Path(path_str)
-    
-    # Production environment (Render)
-    if os.getenv("ENV") == "production":
-        # Try multiple path variations
-        possible_paths = [
-            Path("/tmp") / path,
-            Path("/tmp/uploads/projects/extracted") / path,
-            Path("/tmp") / "uploads" / "projects" / "extracted" / path
-        ]
-        
-        for resolved_path in possible_paths:
-            logger.info(f"Checking: {resolved_path}")
-            if resolved_path.exists():
-                logger.info(f"Found at: {resolved_path}")
-                return resolved_path
-        
-        raise FileNotFoundError(
-            f"Project not found. Tried paths: {[str(p) for p in possible_paths]}"
-        )
-    
-    # Development environment (local)
-    if PROJECT_BASE_PATH:
-        resolved_path = Path(PROJECT_BASE_PATH) / path
-        logger.info(f"Development - checking: {resolved_path}")
-        
-        if resolved_path.exists():
-            return resolved_path
-    
-    # Fallback: try current directory
-    cwd_path = Path.cwd() / path
-    if cwd_path.exists():
-        logger.info(f"Found in current directory: {cwd_path}")
-        return cwd_path
-    
-    raise FileNotFoundError(
-        f"Project path not found: {path_str}\n"
-        f"Environment: {os.getenv('ENV', 'development')}\n"
-        f"Base path: {PROJECT_BASE_PATH}"
-    )
+# ==================== HELPER FUNCTIONS ====================
 
-def get_cache_key(project_path: str) -> str:
-    """Generate a cache key based on project path and modification time"""
-    try:
-        path = Path(project_path)
-        if not path.exists():
-            return None
+def detect_tech_stack_from_files(files_content: Dict[str, str]) -> Dict[str, List[str]]:
+    """Detect technologies from file names and contents (for content-based analysis)"""
+    tech_stack = {
+        "languages": [],
+        "frameworks": [],
+        "databases": [],
+        "tools": []
+    }
+    
+    logger.info(f"Detecting tech stack from {len(files_content)} files")
+    
+    language_map = {
+        '.py': 'Python',
+        '.js': 'JavaScript',
+        '.jsx': 'React/JSX',
+        '.ts': 'TypeScript',
+        '.tsx': 'React/TypeScript',
+        '.java': 'Java',
+        '.cpp': 'C++',
+        '.c': 'C',
+        '.cs': 'C#',
+        '.go': 'Go',
+        '.rs': 'Rust',
+        '.php': 'PHP',
+        '.rb': 'Ruby',
+        '.swift': 'Swift',
+        '.kt': 'Kotlin',
+        '.html': 'HTML',
+        '.css': 'CSS',
+        '.scss': 'SCSS',
+        '.sql': 'SQL'
+    }
+    
+    languages_found = set()
+    frameworks_found = set()
+    databases = set()
+    tools = set()
+    
+    for filename, content in files_content.items():
+        # Detect language from extension
+        for ext, lang in language_map.items():
+            if filename.lower().endswith(ext):
+                languages_found.add(lang)
         
-        # Get the latest modification time of any file in the project
-        latest_mtime = 0
-        for file_path in path.rglob('*'):
-            if file_path.is_file():
-                mtime = file_path.stat().st_mtime
-                if mtime > latest_mtime:
-                    latest_mtime = mtime
+        # Detect frameworks from filename
+        if 'package.json' in filename.lower():
+            tools.add('npm')
+        if 'pom.xml' in filename.lower():
+            tools.add('Maven')
+        if 'build.gradle' in filename.lower():
+            tools.add('Gradle')
+        if 'requirements.txt' in filename.lower():
+            tools.add('pip')
         
-        # Create hash of path + modification time
-        cache_str = f"{project_path}:{latest_mtime}"
-        return hashlib.md5(cache_str.encode()).hexdigest()
-    except Exception as e:
-        logger.warning(f"Could not generate cache key: {e}")
-        return None
+        # Detect frameworks and databases from content
+        content_lower = content.lower()
+        
+        # Frameworks
+        if 'spring' in content_lower or '@springboot' in content_lower:
+            frameworks_found.add('Spring Boot')
+        if 'react' in content_lower or 'import react' in content_lower:
+            frameworks_found.add('React')
+        if 'fastapi' in content_lower:
+            frameworks_found.add('FastAPI')
+        if 'django' in content_lower:
+            frameworks_found.add('Django')
+        if 'flask' in content_lower:
+            frameworks_found.add('Flask')
+        if 'express' in content_lower:
+            frameworks_found.add('Express')
+        if 'angular' in content_lower:
+            frameworks_found.add('Angular')
+        if 'vue' in content_lower:
+            frameworks_found.add('Vue')
+        
+        # Databases
+        db_keywords = {
+            'mysql': 'MySQL',
+            'postgresql': 'PostgreSQL',
+            'postgres': 'PostgreSQL',
+            'mongodb': 'MongoDB',
+            'sqlite': 'SQLite',
+            'redis': 'Redis',
+            'h2database': 'H2',
+            'oracle': 'Oracle',
+            'mariadb': 'MariaDB'
+        }
+        
+        for keyword, db_name in db_keywords.items():
+            if keyword in content_lower:
+                databases.add(db_name)
+    
+    tech_stack["languages"] = sorted(list(languages_found))
+    tech_stack["frameworks"] = sorted(list(frameworks_found))
+    tech_stack["databases"] = sorted(list(databases))
+    tech_stack["tools"] = sorted(list(tools))
+    
+    logger.info(f"Detected tech stack: {tech_stack}")
+    return tech_stack
 
 def detect_technology_stack(project_path: Path) -> Dict[str, List[str]]:
     """Detect technologies used in the project by analyzing file extensions and content"""
@@ -184,7 +224,6 @@ def detect_technology_stack(project_path: Path) -> Dict[str, List[str]]:
     try:
         logger.info(f"Detecting tech stack for: {project_path}")
         
-        # File extension mapping
         language_map = {
             '.py': 'Python',
             '.js': 'JavaScript',
@@ -207,7 +246,6 @@ def detect_technology_stack(project_path: Path) -> Dict[str, List[str]]:
             '.sql': 'SQL'
         }
         
-        # Framework detection patterns
         framework_patterns = {
             'package.json': ['react', 'vue', 'angular', 'express', 'next', 'gatsby', 'svelte'],
             'requirements.txt': ['django', 'flask', 'fastapi', 'pandas', 'numpy', 'tensorflow', 'pytorch'],
@@ -222,14 +260,12 @@ def detect_technology_stack(project_path: Path) -> Dict[str, List[str]]:
         languages_found = set()
         frameworks_found = set()
         
-        # Scan files for languages
         for file_path in project_path.rglob('*'):
             if file_path.is_file():
                 ext = file_path.suffix.lower()
                 if ext in language_map:
                     languages_found.add(language_map[ext])
                 
-                # Check for framework files
                 if file_path.name in framework_patterns:
                     try:
                         content = file_path.read_text(encoding='utf-8', errors='ignore').lower()
@@ -242,7 +278,6 @@ def detect_technology_stack(project_path: Path) -> Dict[str, List[str]]:
         tech_stack["languages"] = sorted(list(languages_found))
         tech_stack["frameworks"] = sorted(list(frameworks_found))
         
-        # Detect databases
         db_keywords = {
             'mysql': 'MySQL',
             'postgresql': 'PostgreSQL',
@@ -270,7 +305,6 @@ def detect_technology_stack(project_path: Path) -> Dict[str, List[str]]:
         
         tech_stack["databases"] = sorted(list(databases))
         
-        # Detect tools
         tools = []
         tool_files = {
             'Dockerfile': 'Docker',
@@ -307,13 +341,11 @@ def read_project_files(project_path: Path, max_files: int = 20) -> Dict[str, str
     try:
         logger.info(f"Reading project files from: {project_path}")
         
-        # Skip directories
         skip_dirs = {
             'node_modules', 'venv', '__pycache__', 'build', 'dist', 
             '.git', 'target', 'bin', 'obj', '.next', '.nuxt'
         }
         
-        # Priority files to read
         priority_extensions = [
             '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.c', 
             '.go', '.rs', '.php', '.rb', '.swift', '.kt'
@@ -325,7 +357,6 @@ def read_project_files(project_path: Path, max_files: int = 20) -> Dict[str, str
         
         files_read = 0
         
-        # Read priority files first
         for priority_file in priority_files:
             if files_read >= max_files:
                 break
@@ -339,13 +370,11 @@ def read_project_files(project_path: Path, max_files: int = 20) -> Dict[str, str
                 except Exception as e:
                     logger.warning(f"Could not read {file_path}: {e}")
         
-        # Read source code files
         for file_path in project_path.rglob('*'):
             if files_read >= max_files:
                 break
                 
             if file_path.is_file() and file_path.suffix in priority_extensions:
-                # Skip unwanted directories
                 if any(skip_dir in file_path.parts for skip_dir in skip_dirs):
                     continue
                     
@@ -369,7 +398,6 @@ def analyze_with_openai(tech_stack: Dict, files_content: Dict, project_name: str
     
     logger.info(f"Starting OpenAI analysis for project: {project_name}")
     
-    # Prepare code samples
     files_summary = "\n\n".join([
         f"File: {filename}\n```\n{content[:1000]}\n```" 
         for filename, content in list(files_content.items())[:10]
@@ -433,7 +461,6 @@ Be specific, constructive, and educational. Provide concrete examples and action
         content = response.choices[0].message.content
         logger.info("Received response from OpenAI")
         
-        # Extract JSON from response
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0].strip()
         elif "```" in content:
@@ -484,6 +511,69 @@ def get_default_analysis() -> Dict:
         ]
     }
 
+def resolve_project_path(path_str: str) -> Path:
+    """Resolve project path to absolute path"""
+    logger.info(f"Original path: {path_str}")
+    
+    path = Path(path_str)
+    
+    if os.getenv("ENV") == "production":
+        possible_paths = [
+            Path("/tmp") / path,
+            Path("/tmp/uploads/projects/extracted") / path,
+            Path("/tmp") / "uploads" / "projects" / "extracted" / path
+        ]
+        
+        for resolved_path in possible_paths:
+            logger.info(f"Checking: {resolved_path}")
+            if resolved_path.exists():
+                logger.info(f"Found at: {resolved_path}")
+                return resolved_path
+        
+        raise FileNotFoundError(
+            f"Project not found. Tried paths: {[str(p) for p in possible_paths]}"
+        )
+    
+    if PROJECT_BASE_PATH:
+        resolved_path = Path(PROJECT_BASE_PATH) / path
+        logger.info(f"Development - checking: {resolved_path}")
+        
+        if resolved_path.exists():
+            return resolved_path
+    
+    cwd_path = Path.cwd() / path
+    if cwd_path.exists():
+        logger.info(f"Found in current directory: {cwd_path}")
+        return cwd_path
+    
+    raise FileNotFoundError(
+        f"Project path not found: {path_str}\n"
+        f"Environment: {os.getenv('ENV', 'development')}\n"
+        f"Base path: {PROJECT_BASE_PATH}"
+    )
+
+def get_cache_key(project_path: str) -> str:
+    """Generate a cache key based on project path and modification time"""
+    try:
+        path = Path(project_path)
+        if not path.exists():
+            return None
+        
+        latest_mtime = 0
+        for file_path in path.rglob('*'):
+            if file_path.is_file():
+                mtime = file_path.stat().st_mtime
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+        
+        cache_str = f"{project_path}:{latest_mtime}"
+        return hashlib.md5(cache_str.encode()).hexdigest()
+    except Exception as e:
+        logger.warning(f"Could not generate cache key: {e}")
+        return None
+
+# ==================== ENDPOINTS ====================
+
 @app.get("/")
 async def root():
     """Root endpoint"""
@@ -495,6 +585,7 @@ async def root():
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze (POST)",
+            "analyze_content": "/analyze-content (POST)",
             "docs": "/docs"
         }
     }
@@ -513,11 +604,9 @@ async def health_check():
         "allowed_origins": os.getenv("ALLOWED_ORIGINS", "not set"),
     }
     
-    # Check if base path is accessible
     try:
         if Path(PROJECT_BASE_PATH).exists():
             health_status["base_path_readable"] = True
-            # Count projects if possible
             project_count = len(list(Path(PROJECT_BASE_PATH).iterdir()))
             health_status["projects_found"] = project_count
         else:
@@ -531,13 +620,12 @@ async def health_check():
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_project(request: AnalysisRequest):
-    """Main endpoint to analyze a student project"""
+    """Main endpoint to analyze a student project (path-based)"""
     
     logger.info(f"Received analysis request for project: {request.project_name}")
     logger.info(f"Original path: {request.project_path}")
     
     try:
-        # Resolve project path (handles both relative and absolute)
         try:
             project_path = resolve_project_path(request.project_path)
         except FileNotFoundError as e:
@@ -549,17 +637,14 @@ async def analyze_project(request: AnalysisRequest):
         
         logger.info(f"Resolved to absolute path: {project_path}")
         
-        # Check cache
         cache_key = get_cache_key(str(project_path))
         if cache_key and cache_key in analysis_cache:
             logger.info(f"Returning cached analysis for: {request.project_name}")
             return analysis_cache[cache_key]
         
-        # Step 1: Detect technology stack
         logger.info("Step 1: Detecting technology stack")
         tech_stack = detect_technology_stack(project_path)
         
-        # Step 2: Read project files
         logger.info("Step 2: Reading project files")
         files_content = read_project_files(project_path)
         
@@ -567,7 +652,6 @@ async def analyze_project(request: AnalysisRequest):
             logger.error("No readable files found in project")
             raise HTTPException(status_code=400, detail="No readable files found in project")
         
-        # Step 3: Analyze with OpenAI
         logger.info("Step 3: Analyzing with OpenAI")
         ai_analysis = analyze_with_openai(
             tech_stack=tech_stack,
@@ -576,7 +660,6 @@ async def analyze_project(request: AnalysisRequest):
             student_description=request.student_description
         )
         
-        # Construct response
         response = AnalysisResponse(
             project_name=request.project_name,
             student_description=request.student_description,
@@ -590,10 +673,56 @@ async def analyze_project(request: AnalysisRequest):
             analysis_timestamp=datetime.now().isoformat()
         )
         
-        # Cache the result
         if cache_key:
             analysis_cache[cache_key] = response
             logger.info(f"Cached analysis result with key: {cache_key}")
+        
+        logger.info(f"Analysis completed successfully for: {request.project_name}")
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Analysis failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+@app.post("/analyze-content")
+async def analyze_project_content(request: AnalysisRequestWithContent):
+    """Analyze project using provided file contents (for separate server deployment)"""
+    
+    logger.info(f"Received content-based analysis request for project: {request.project_name}")
+    logger.info(f"Files received: {len(request.files_content)}")
+    
+    try:
+        if not request.files_content:
+            raise HTTPException(status_code=400, detail="No file contents provided")
+        
+        # Detect tech stack from file contents
+        logger.info("Step 1: Detecting technology stack from file contents")
+        tech_stack = detect_tech_stack_from_files(request.files_content)
+        
+        # Analyze with OpenAI
+        logger.info("Step 2: Analyzing with OpenAI")
+        ai_analysis = analyze_with_openai(
+            tech_stack=tech_stack,
+            files_content=request.files_content,
+            project_name=request.project_name,
+            student_description=request.student_description
+        )
+        
+        # Construct response
+        response = {
+            "project_name": request.project_name,
+            "student_description": request.student_description,
+            "detected_tech_stack": tech_stack,
+            "code_quality_score": ai_analysis.get("code_quality_score", 0),
+            "overall_grade": ai_analysis.get("overall_grade", "N/A"),
+            "detailed_analysis": ai_analysis.get("detailed_analysis", {}),
+            "recommendations": ai_analysis.get("recommendations", []),
+            "strengths": ai_analysis.get("strengths", []),
+            "weaknesses": ai_analysis.get("weaknesses", []),
+            "analysis_timestamp": datetime.now().isoformat()
+        }
         
         logger.info(f"Analysis completed successfully for: {request.project_name}")
         return response
