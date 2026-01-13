@@ -11,7 +11,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import zipfile
 import io
-from supabase import create_client, Client
+import httpx
 
 # Load environment variables
 load_dotenv()
@@ -65,7 +65,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Supabase client
+# Simple Supabase Storage client using httpx (no Rust dependencies)
+class SupabaseStorage:
+    """Lightweight Supabase Storage client"""
+    def __init__(self, url: str, key: str):
+        self.url = url
+        self.key = key
+        self.headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+        }
+        self.timeout = httpx.Timeout(30.0, connect=10.0)
+    
+    def download(self, bucket: str, path: str) -> bytes:
+        """Download a file from Supabase storage"""
+        url = f"{self.url}/storage/v1/object/{bucket}/{path}"
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.get(url, headers=self.headers)
+                response.raise_for_status()
+                return response.content
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP {e.response.status_code} error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            raise
+    
+    def list_buckets(self):
+        """List all buckets (for health check)"""
+        url = f"{self.url}/storage/v1/bucket"
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(url, headers=self.headers)
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            logger.error(f"List buckets error: {e}")
+            raise
+
+# Initialize Supabase Storage client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
@@ -73,8 +112,8 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     logger.error("Supabase credentials not found in environment variables")
     raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-logger.info("Supabase client initialized")
+supabase_storage = SupabaseStorage(SUPABASE_URL, SUPABASE_KEY)
+logger.info("Supabase storage client initialized")
 
 # Initialize OpenAI client
 api_key = os.getenv("OPENAI_API_KEY")
@@ -121,23 +160,25 @@ def download_from_supabase(storage_path: str) -> bytes:
         if storage_path.startswith('/'):
             storage_path = storage_path[1:]
         
-        # Download file from Supabase storage
         # The storage_path should be like "projects/filename.zip"
-        bucket_name = "projects"  # Your Supabase bucket name
+        bucket_name = "projects"
         file_path = storage_path.replace(f"{bucket_name}/", "")
         
-        response = supabase.storage.from_(bucket_name).download(file_path)
+        response = supabase_storage.download(bucket_name, file_path)
         
-        if response:
-            logger.info(f"Successfully downloaded {len(response)} bytes from Supabase")
-            return response
-        else:
-            raise Exception("Empty response from Supabase")
+        logger.info(f"Successfully downloaded {len(response)} bytes from Supabase")
+        return response
             
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error downloading from Supabase: {e}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Failed to download project from storage: HTTP {e.response.status_code}"
+        )
     except Exception as e:
         logger.error(f"Error downloading from Supabase: {e}")
         raise HTTPException(
-            status_code=404,
+            status_code=500,
             detail=f"Failed to download project from storage: {str(e)}"
         )
 
@@ -494,10 +535,12 @@ async def health_check():
     
     try:
         # Test Supabase connection
-        supabase.storage.list_buckets()
+        supabase_storage.list_buckets()
         health_status["supabase_connection"] = "connected"
     except Exception as e:
+        logger.warning(f"Supabase connection check failed: {e}")
         health_status["supabase_connection"] = f"error: {str(e)}"
+        health_status["status"] = "degraded"
     
     return health_status
 
