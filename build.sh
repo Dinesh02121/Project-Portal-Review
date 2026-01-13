@@ -1,8 +1,5 @@
-#!/usr/bin/env bash
-set -e
-
-echo "Python version:"
-python --version
+#!/bin/bash
+pip install --only-binary=:all: pydantic-core pydantic
 
 pip install --upgrade pip
 pip install -r requirements.txt
