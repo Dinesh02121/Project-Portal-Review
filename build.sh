@@ -1,9 +1,8 @@
-# #!/usr/bin/env bash
-# # exit on error
-# set -o errexit
+#!/usr/bin/env bash
+set -e
 
-# # Upgrade pip
-# pip install --upgrade pip
+echo "Python version:"
+python --version
 
-# # Install dependencies
-# pip install --no-cache-dir -r requirements.txt
+pip install --upgrade pip
+pip install -r requirements.txt
