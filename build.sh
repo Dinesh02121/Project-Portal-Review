@@ -5,5 +5,5 @@ set -o errexit
 # Upgrade pip
 pip install --upgrade pip
 
-# Install dependencies with prefer-binary flag
-pip install --no-cache-dir --prefer-binary -r requirements.txt
+# Install dependencies
+pip install --no-cache-dir -r requirements.txt
