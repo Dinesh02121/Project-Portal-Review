@@ -3,18 +3,16 @@ services:
     name: ai-analysis-service
     env: python
     region: oregon
+
+    pythonVersion: 3.11.9   # ✅ THIS IS THE KEY LINE
+
     buildCommand: "./build.sh"
     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
       - key: ENV
         value: production
       - key: OPENAI_API_KEY
-        sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_KEY
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
