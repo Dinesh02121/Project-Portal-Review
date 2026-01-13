@@ -11,7 +11,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import zipfile
 import io
-import httpx
+import requests
 
 # Load environment variables
 load_dotenv()
@@ -65,9 +65,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Simple Supabase Storage client using httpx (no Rust dependencies)
+# Simple Supabase Storage client using requests (pure Python, no Rust)
 class SupabaseStorage:
-    """Lightweight Supabase Storage client"""
+    """Lightweight Supabase Storage client using requests"""
     def __init__(self, url: str, key: str):
         self.url = url
         self.key = key
@@ -75,17 +75,15 @@ class SupabaseStorage:
             "apikey": key,
             "Authorization": f"Bearer {key}",
         }
-        self.timeout = httpx.Timeout(30.0, connect=10.0)
     
     def download(self, bucket: str, path: str) -> bytes:
         """Download a file from Supabase storage"""
         url = f"{self.url}/storage/v1/object/{bucket}/{path}"
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.get(url, headers=self.headers)
-                response.raise_for_status()
-                return response.content
-        except httpx.HTTPStatusError as e:
+            response = requests.get(url, headers=self.headers, timeout=30)
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP {e.response.status_code} error: {e}")
             raise
         except Exception as e:
@@ -96,10 +94,9 @@ class SupabaseStorage:
         """List all buckets (for health check)"""
         url = f"{self.url}/storage/v1/bucket"
         try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.get(url, headers=self.headers)
-                response.raise_for_status()
-                return response.json()
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            return response.json()
         except Exception as e:
             logger.error(f"List buckets error: {e}")
             raise
@@ -169,11 +166,12 @@ def download_from_supabase(storage_path: str) -> bytes:
         logger.info(f"Successfully downloaded {len(response)} bytes from Supabase")
         return response
             
-    except httpx.HTTPStatusError as e:
+    except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP error downloading from Supabase: {e}")
+        status_code = e.response.status_code if e.response else 500
         raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"Failed to download project from storage: HTTP {e.response.status_code}"
+            status_code=status_code,
+            detail=f"Failed to download project from storage: HTTP {status_code}"
         )
     except Exception as e:
         logger.error(f"Error downloading from Supabase: {e}")
