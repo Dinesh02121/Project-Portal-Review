@@ -618,6 +618,8 @@ async def health_check():
     
     return health_status
 
+
+
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_project(request: AnalysisRequest):
     """Main endpoint to analyze a student project (path-based)"""
@@ -685,6 +687,17 @@ async def analyze_project(request: AnalysisRequest):
     except Exception as e:
         logger.error(f"Analysis failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+@app.middleware("http")
+async def timeout_middleware(request: Request, call_next):
+    try:
+        # Increase timeout to 90 seconds
+        return await asyncio.wait_for(call_next(request), timeout=90.0)
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"detail": "Request timeout - project analysis took too long"}
+        )
 
 @app.post("/analyze-content")
 async def analyze_project_content(request: AnalysisRequestWithContent):
