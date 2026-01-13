@@ -1,6 +1,6 @@
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
 python-dotenv==1.0.1
-pydantic==2.6.4
-openai==1.14.3
-python-multipart==0.0.9
+pydantic==2.10.6
+openai==1.59.7
+python-multipart==0.0.20
