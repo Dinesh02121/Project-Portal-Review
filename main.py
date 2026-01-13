@@ -6,13 +6,12 @@ import os
 import json
 import hashlib
 import logging
-from pathlib import Path
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
-import io
-from supabase import create_client, Client
 import zipfile
+import io
+import requests
 
 # Load environment variables
 load_dotenv()
@@ -21,68 +20,61 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('analysis.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AI Project Analysis API",
-    description="Comprehensive code review and assessment using OpenAI",
+    description="Comprehensive code review and assessment using OpenAI/Groq",
     version="2.0.0"
 )
 
 # CORS configuration
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "")
+env = os.getenv("ENV", "development")
 
 if not allowed_origins_str:
-    logger.warning("ALLOWED_ORIGINS not set, using localhost defaults")
-    allowed_origins = ["http://localhost:3000", "http://localhost:8080"]
+    logger.warning("ALLOWED_ORIGINS not set")
+    if env == "development":
+        allowed_origins = ["http://localhost:3000", "http://localhost:8080", "*"]
+    else:
+        allowed_origins = []
 else:
     allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
 
-# Only add wildcard in development (NOT in production)
-env = os.getenv("ENV", "development")
-if env == "development":
-    allowed_origins.append("*")
-
 logger.info(f"Environment: {env}")
+logger.info(f"Allowed origins: {allowed_origins}")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=allowed_origins if allowed_origins else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Supabase client
+# Supabase configuration (pure HTTP, no SDK)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "project-files")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # Service role key for backend
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "projects")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("Supabase credentials not found in environment variables")
-    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
+    logger.error("Supabase credentials not found")
+    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-logger.info(f"Supabase client initialized for bucket: {SUPABASE_BUCKET}")
+logger.info(f"Supabase configured - URL: {SUPABASE_URL}, Bucket: {SUPABASE_BUCKET}")
 
-# Initialize OpenAI client
+# Initialize OpenAI/Groq client
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
-    logger.error("OPENAI_API_KEY not found in environment variables")
-    raise ValueError("OPENAI_API_KEY must be set in environment variables")
+    logger.error("OPENAI_API_KEY not found")
+    raise ValueError("OPENAI_API_KEY must be set")
 
-# Detect if using Groq or OpenAI
+# Auto-detect Groq or OpenAI
 if api_key.startswith('gsk_'):
     logger.info("Using Groq API")
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.groq.com/openai/v1"
-    )
+    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
     MODEL = "llama-3.3-70b-versatile"
 else:
     logger.info("Using OpenAI API")
@@ -93,7 +85,7 @@ else:
 analysis_cache = {}
 
 class AnalysisRequest(BaseModel):
-    project_path: str  # This will be the Supabase storage path (e.g., "projects/123/project.zip")
+    project_path: str  # Supabase storage path (e.g., "projects/123/file.zip")
     project_name: str
     student_description: str
 
@@ -109,41 +101,61 @@ class AnalysisResponse(BaseModel):
     weaknesses: List[str]
     analysis_timestamp: str
 
-def get_cache_key(project_path: str) -> str:
-    """Generate a cache key based on project path"""
-    try:
-        cache_str = f"{project_path}:{datetime.now().date()}"
-        return hashlib.md5(cache_str.encode()).hexdigest()
-    except Exception as e:
-        logger.warning(f"Could not generate cache key: {e}")
-        return None
-
 def download_from_supabase(storage_path: str) -> bytes:
-    """Download ZIP file from Supabase storage"""
+    """Download ZIP from Supabase Storage using pure HTTP requests"""
     try:
         logger.info(f"Downloading from Supabase: {storage_path}")
         
-        # Remove leading slash if present
+        # Clean path
         clean_path = storage_path.lstrip('/')
         
-        # Download file from Supabase storage
-        response = supabase.storage.from_(SUPABASE_BUCKET).download(clean_path)
+        # Build storage URL
+        # Format: {SUPABASE_URL}/storage/v1/object/{bucket}/{path}
+        storage_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{clean_path}"
         
-        if response:
-            logger.info(f"Successfully downloaded {len(response)} bytes from Supabase")
-            return response
+        logger.info(f"Storage URL: {storage_url}")
+        
+        # Make authenticated request
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}"
+        }
+        
+        response = requests.get(storage_url, headers=headers, timeout=60)
+        
+        if response.status_code == 200:
+            logger.info(f"Successfully downloaded {len(response.content)} bytes")
+            return response.content
         else:
-            raise Exception("Empty response from Supabase")
+            error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+            logger.error(f"Download failed: {error_msg}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Failed to download from Supabase: {error_msg}"
+            )
             
+    except requests.exceptions.Timeout:
+        logger.error("Timeout downloading from Supabase")
+        raise HTTPException(status_code=504, detail="Download timeout")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error: {e}")
+        raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error downloading from Supabase: {e}")
-        raise HTTPException(
-            status_code=404,
-            detail=f"Failed to download project from Supabase: {str(e)}"
-        )
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+def get_cache_key(project_path: str) -> str:
+    """Generate cache key"""
+    try:
+        cache_str = f"{project_path}:{datetime.now().strftime('%Y-%m-%d')}"
+        return hashlib.md5(cache_str.encode()).hexdigest()
+    except:
+        return None
 
 def detect_technology_stack(zip_bytes: bytes) -> Dict[str, List[str]]:
-    """Detect technologies used in the project by analyzing ZIP contents"""
+    """Detect technologies from ZIP"""
     tech_stack = {
         "languages": [],
         "frameworks": [],
@@ -152,329 +164,252 @@ def detect_technology_stack(zip_bytes: bytes) -> Dict[str, List[str]]:
     }
     
     try:
-        logger.info("Detecting tech stack from ZIP file")
+        logger.info("Detecting tech stack")
         
-        # File extension mapping
         language_map = {
-            '.py': 'Python',
-            '.js': 'JavaScript',
-            '.jsx': 'React/JSX',
-            '.ts': 'TypeScript',
-            '.tsx': 'React/TypeScript',
-            '.java': 'Java',
-            '.cpp': 'C++',
-            '.c': 'C',
-            '.cs': 'C#',
-            '.go': 'Go',
-            '.rs': 'Rust',
-            '.php': 'PHP',
-            '.rb': 'Ruby',
-            '.swift': 'Swift',
-            '.kt': 'Kotlin',
-            '.html': 'HTML',
-            '.css': 'CSS',
-            '.scss': 'SCSS',
-            '.sql': 'SQL'
+            '.py': 'Python', '.js': 'JavaScript', '.jsx': 'React/JSX',
+            '.ts': 'TypeScript', '.tsx': 'React/TypeScript', '.java': 'Java',
+            '.cpp': 'C++', '.c': 'C', '.cs': 'C#', '.go': 'Go',
+            '.rs': 'Rust', '.php': 'PHP', '.rb': 'Ruby', '.swift': 'Swift',
+            '.kt': 'Kotlin', '.html': 'HTML', '.css': 'CSS', '.sql': 'SQL'
         }
         
-        # Framework detection patterns
         framework_patterns = {
-            'package.json': ['react', 'vue', 'angular', 'express', 'next', 'gatsby', 'svelte'],
-            'requirements.txt': ['django', 'flask', 'fastapi', 'pandas', 'numpy', 'tensorflow', 'pytorch'],
-            'pom.xml': ['spring', 'hibernate', 'maven'],
-            'build.gradle': ['spring', 'android', 'gradle'],
+            'package.json': ['react', 'vue', 'angular', 'express', 'next'],
+            'requirements.txt': ['django', 'flask', 'fastapi', 'pandas', 'numpy'],
+            'pom.xml': ['spring', 'hibernate'],
+            'build.gradle': ['spring', 'android'],
             'Gemfile': ['rails', 'sinatra'],
-            'composer.json': ['laravel', 'symfony', 'wordpress'],
-            'go.mod': ['gin', 'echo', 'fiber'],
-            'Cargo.toml': ['actix', 'rocket', 'tokio']
+            'composer.json': ['laravel', 'symfony'],
+            'go.mod': ['gin', 'echo'],
+            'Cargo.toml': ['actix', 'rocket']
+        }
+        
+        db_keywords = {
+            'mysql': 'MySQL', 'postgresql': 'PostgreSQL', 'mongodb': 'MongoDB',
+            'sqlite': 'SQLite', 'redis': 'Redis', 'supabase': 'Supabase',
+            'firebase': 'Firebase'
+        }
+        
+        tool_files = {
+            'Dockerfile': 'Docker', 'docker-compose.yml': 'Docker Compose',
+            '.gitignore': 'Git', 'package.json': 'npm'
         }
         
         languages_found = set()
         frameworks_found = set()
-        databases = set()
-        tools = []
-        
-        # Database keywords
-        db_keywords = {
-            'mysql': 'MySQL',
-            'postgresql': 'PostgreSQL',
-            'postgres': 'PostgreSQL',
-            'mongodb': 'MongoDB',
-            'sqlite': 'SQLite',
-            'redis': 'Redis',
-            'cassandra': 'Cassandra',
-            'oracle': 'Oracle',
-            'mariadb': 'MariaDB',
-            'dynamodb': 'DynamoDB',
-            'firebase': 'Firebase',
-            'supabase': 'Supabase'
-        }
-        
-        # Tool files
-        tool_files = {
-            'Dockerfile': 'Docker',
-            'docker-compose.yml': 'Docker Compose',
-            '.gitignore': 'Git',
-            'package.json': 'npm',
-            'yarn.lock': 'Yarn',
-            'Pipfile': 'Pipenv',
-            'poetry.lock': 'Poetry',
-            '.travis.yml': 'Travis CI',
-            '.gitlab-ci.yml': 'GitLab CI',
-            'Jenkinsfile': 'Jenkins'
-        }
+        databases_found = set()
+        tools_found = set()
         
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            for file_info in zf.filelist:
-                filename = file_info.filename
-                
-                # Skip macOS metadata and directories
-                if '__MACOSX' in filename or filename.endswith('/'):
+            for file_info in zf.namelist():
+                if '__MACOSX' in file_info or '.DS_Store' in file_info:
                     continue
                 
-                # Get file extension
-                ext = os.path.splitext(filename)[1].lower()
-                if ext in language_map:
-                    languages_found.add(language_map[ext])
+                # Languages
+                for ext, lang in language_map.items():
+                    if file_info.lower().endswith(ext):
+                        languages_found.add(lang)
                 
-                # Check for framework files
-                base_name = os.path.basename(filename)
-                if base_name in framework_patterns:
+                filename = os.path.basename(file_info)
+                
+                # Frameworks
+                if filename in framework_patterns:
                     try:
                         content = zf.read(file_info).decode('utf-8', errors='ignore').lower()
-                        for framework in framework_patterns[base_name]:
-                            if framework in content:
-                                frameworks_found.add(framework.capitalize())
-                    except Exception as e:
-                        logger.warning(f"Could not read {base_name}: {e}")
+                        for fw in framework_patterns[filename]:
+                            if fw in content:
+                                frameworks_found.add(fw.capitalize())
+                    except:
+                        pass
                 
-                # Check for tool files
-                if base_name in tool_files:
-                    tools.append(tool_files[base_name])
-                
-                # Check for database usage in code files
-                if ext in ['.py', '.js', '.java', '.properties', '.yml', '.yaml', '.env']:
+                # Databases
+                if file_info.lower().endswith(('.py', '.js', '.java', '.env', '.yml')):
                     try:
                         content = zf.read(file_info).decode('utf-8', errors='ignore').lower()
-                        for keyword, db_name in db_keywords.items():
-                            if keyword in content:
-                                databases.add(db_name)
-                    except Exception:
-                        continue
+                        for kw, db in db_keywords.items():
+                            if kw in content:
+                                databases_found.add(db)
+                    except:
+                        pass
+                
+                # Tools
+                for tool_file, tool_name in tool_files.items():
+                    if file_info.endswith(tool_file):
+                        tools_found.add(tool_name)
         
         tech_stack["languages"] = sorted(list(languages_found))
         tech_stack["frameworks"] = sorted(list(frameworks_found))
-        tech_stack["databases"] = sorted(list(databases))
-        tech_stack["tools"] = sorted(list(set(tools)))
+        tech_stack["databases"] = sorted(list(databases_found))
+        tech_stack["tools"] = sorted(list(tools_found))
         
-        logger.info(f"Detected tech stack: {tech_stack}")
+        logger.info(f"Tech stack: {tech_stack}")
         
     except Exception as e:
         logger.error(f"Error detecting tech stack: {e}")
     
     return tech_stack
 
-def read_project_files_from_zip(zip_bytes: bytes, max_files: int = 20) -> Dict[str, str]:
-    """Read important project files from ZIP for analysis"""
+def read_project_files(zip_bytes: bytes, max_files: int = 20) -> Dict[str, str]:
+    """Read project files from ZIP"""
     files_content = {}
     
     try:
-        logger.info("Reading project files from ZIP")
+        logger.info("Reading project files")
         
-        # Skip directories
-        skip_patterns = [
-            'node_modules/', 'venv/', '__pycache__/', 'build/', 'dist/', 
-            '.git/', 'target/', 'bin/', 'obj/', '.next/', '.nuxt/',
-            '__MACOSX/'
-        ]
+        skip_dirs = {
+            'node_modules', 'venv', '__pycache__', 'build', 'dist',
+            '.git', 'target', '__MACOSX'
+        }
         
-        # Priority files to read
         priority_extensions = [
-            '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.c', 
-            '.go', '.rs', '.php', '.rb', '.swift', '.kt'
+            '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp',
+            '.go', '.rs', '.php', '.rb', '.kt'
         ]
+        
         priority_files = [
-            'README.md', 'README.txt', 'package.json', 'requirements.txt', 
-            'pom.xml', 'build.gradle', 'Cargo.toml', 'go.mod'
+            'README.md', 'package.json', 'requirements.txt',
+            'pom.xml', 'build.gradle'
         ]
         
         files_read = 0
         
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            file_list = zf.filelist
-            
-            # Read priority files first
-            for file_info in file_list:
+            # Priority files first
+            for pf in priority_files:
                 if files_read >= max_files:
                     break
-                    
-                filename = file_info.filename
-                base_name = os.path.basename(filename)
-                
-                # Skip unwanted patterns
-                if any(pattern in filename for pattern in skip_patterns):
-                    continue
-                
-                if base_name in priority_files:
-                    try:
-                        content = zf.read(file_info).decode('utf-8', errors='ignore')
-                        files_content[filename] = content[:5000]
-                        files_read += 1
-                        logger.debug(f"Read priority file: {base_name}")
-                    except Exception as e:
-                        logger.warning(f"Could not read {filename}: {e}")
+                for file_info in zf.namelist():
+                    if file_info.endswith(pf) and not any(sd in file_info for sd in skip_dirs):
+                        try:
+                            content = zf.read(file_info).decode('utf-8', errors='ignore')
+                            files_content[file_info] = content[:5000]
+                            files_read += 1
+                            break
+                        except:
+                            pass
             
-            # Read source code files
-            for file_info in file_list:
+            # Source files
+            for file_info in zf.namelist():
                 if files_read >= max_files:
                     break
-                
-                filename = file_info.filename
-                ext = os.path.splitext(filename)[1].lower()
-                
-                # Skip unwanted patterns
-                if any(pattern in filename for pattern in skip_patterns):
+                if file_info.endswith('/') or any(sd in file_info for sd in skip_dirs):
                     continue
-                
-                if ext in priority_extensions and filename not in files_content:
+                if any(file_info.lower().endswith(ext) for ext in priority_extensions):
                     try:
                         content = zf.read(file_info).decode('utf-8', errors='ignore')
-                        files_content[filename] = content[:3000]
+                        files_content[file_info] = content[:3000]
                         files_read += 1
-                        logger.debug(f"Read source file: {os.path.basename(filename)}")
-                    except Exception as e:
-                        logger.warning(f"Could not read {filename}: {e}")
+                    except:
+                        pass
         
-        logger.info(f"Read {files_read} files from ZIP")
-    
+        logger.info(f"Read {files_read} files")
+        
     except Exception as e:
-        logger.error(f"Error reading project files: {e}")
+        logger.error(f"Error reading files: {e}")
     
     return files_content
 
-def analyze_with_openai(tech_stack: Dict, files_content: Dict, project_name: str, student_description: str) -> Dict:
-    """Use OpenAI to analyze the project and provide detailed feedback"""
+def analyze_with_ai(tech_stack: Dict, files_content: Dict, 
+                    project_name: str, student_description: str) -> Dict:
+    """Analyze with AI"""
+    logger.info(f"Analyzing: {project_name}")
     
-    logger.info(f"Starting AI analysis for project: {project_name}")
-    
-    # Prepare code samples
     files_summary = "\n\n".join([
-        f"File: {filename}\n```\n{content[:1000]}\n```" 
-        for filename, content in list(files_content.items())[:10]
+        f"File: {fn}\n```\n{content[:1000]}\n```"
+        for fn, content in list(files_content.items())[:10]
     ])
     
-    prompt = f"""You are an expert code reviewer and educator. Analyze this student project comprehensively and provide constructive feedback.
+    prompt = f"""You are an expert code reviewer. Analyze this student project.
 
-PROJECT DETAILS:
-Name: {project_name}
-Student Description: {student_description}
+PROJECT: {project_name}
+DESCRIPTION: {student_description}
 
-DETECTED TECHNOLOGIES:
+TECH STACK:
 {json.dumps(tech_stack, indent=2)}
 
 CODE SAMPLES:
 {files_summary}
 
-Please provide a detailed analysis in JSON format with the following structure:
+Provide detailed analysis in JSON format:
 {{
-    "code_quality_score": <float between 0-100>,
+    "code_quality_score": <0-100>,
     "overall_grade": "<A+, A, A-, B+, B, B-, C+, C, C-, D, F>",
     "detailed_analysis": {{
-        "code_structure": "<detailed analysis of project architecture and organization>",
-        "code_quality": "<analysis of code quality, readability, and adherence to best practices>",
-        "functionality": "<analysis of features, completeness, and functionality>",
-        "documentation": "<analysis of code comments, README, and documentation>",
-        "testing": "<analysis of test coverage and quality>",
-        "security": "<analysis of security considerations and vulnerabilities>",
-        "performance": "<analysis of performance and efficiency>"
+        "code_structure": "<analysis>",
+        "code_quality": "<analysis>",
+        "functionality": "<analysis>",
+        "documentation": "<analysis>",
+        "testing": "<analysis>",
+        "security": "<analysis>",
+        "performance": "<analysis>"
     }},
-    "strengths": [
-        "<3-5 specific strengths with examples>"
-    ],
-    "weaknesses": [
-        "<3-5 specific areas for improvement with explanations>"
-    ],
-    "recommendations": [
-        "<5-7 specific, actionable recommendations for improvement>"
-    ]
+    "strengths": ["<3-5 specific strengths>"],
+    "weaknesses": ["<3-5 areas for improvement>"],
+    "recommendations": ["<5-7 actionable recommendations>"]
 }}
 
-Be specific, constructive, and educational. Provide concrete examples and actionable advice."""
+Be specific and constructive."""
 
     try:
         response = client.chat.completions.create(
             model=MODEL,
             messages=[
-                {
-                    "role": "system", 
-                    "content": "You are an expert code reviewer and educator who provides detailed, constructive feedback on student projects. Focus on helping students learn and improve."
-                },
-                {
-                    "role": "user", 
-                    "content": prompt
-                }
+                {"role": "system", "content": "You are an expert code reviewer providing constructive feedback."},
+                {"role": "user", "content": prompt}
             ],
             temperature=0.7,
             max_tokens=2500
         )
         
         content = response.choices[0].message.content
-        logger.info("Received response from AI")
         
-        # Extract JSON from response
+        # Extract JSON
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
         
         analysis = json.loads(content)
-        logger.info(f"Analysis completed with grade: {analysis.get('overall_grade')}")
+        logger.info(f"Analysis complete: {analysis.get('overall_grade')}")
         return analysis
         
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}")
-        return get_default_analysis()
     except Exception as e:
-        logger.error(f"AI API error: {e}")
+        logger.error(f"AI error: {e}")
         return get_default_analysis()
 
 def get_default_analysis() -> Dict:
-    """Return default analysis when AI analysis fails"""
+    """Default analysis fallback"""
     return {
         "code_quality_score": 75.0,
         "overall_grade": "B",
         "detailed_analysis": {
-            "code_structure": "Automated analysis temporarily unavailable. Manual review recommended.",
-            "code_quality": "Please review code manually for quality assessment.",
-            "functionality": "Functionality assessment requires manual inspection.",
+            "code_structure": "Analysis unavailable. Manual review recommended.",
+            "code_quality": "Manual review needed.",
+            "functionality": "Manual inspection required.",
             "documentation": "Documentation review needed.",
-            "testing": "Test coverage assessment pending manual review.",
+            "testing": "Test coverage pending review.",
             "security": "Security review recommended.",
-            "performance": "Performance analysis requires manual testing."
+            "performance": "Performance analysis needed."
         },
         "strengths": [
             "Project structure appears organized",
-            "Multiple technologies integrated",
-            "Clear project purpose from description"
+            "Multiple technologies integrated"
         ],
         "weaknesses": [
-            "Automated analysis unavailable",
-            "Manual detailed review recommended"
+            "Automated analysis unavailable"
         ],
         "recommendations": [
-            "Add comprehensive documentation and README",
-            "Implement unit and integration tests",
-            "Follow coding best practices and style guides",
-            "Add proper error handling throughout",
-            "Review security best practices",
-            "Optimize performance-critical sections",
-            "Add code comments for complex logic"
+            "Add comprehensive documentation",
+            "Implement unit tests",
+            "Follow coding best practices",
+            "Add error handling",
+            "Review security practices"
         ]
     }
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "message": "AI Project Analysis API",
         "status": "active",
@@ -483,77 +418,72 @@ async def root():
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze (POST)",
+            "cache/clear": "/cache/clear (GET)",
             "docs": "/docs"
         }
     }
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check endpoint"""
-    
-    health_status = {
+    health = {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "openai_configured": bool(api_key),
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
-        "supabase_bucket": SUPABASE_BUCKET,
-        "environment": os.getenv("ENV", "development"),
-        "model": MODEL,
-        "allowed_origins": os.getenv("ALLOWED_ORIGINS", "not set"),
+        "environment": env,
+        "model": MODEL
     }
     
     # Test Supabase connection
     try:
-        # Try to list buckets to verify connection
-        buckets = supabase.storage.list_buckets()
-        health_status["supabase_connection"] = "ok"
-        health_status["available_buckets"] = len(buckets)
+        test_url = f"{SUPABASE_URL}/storage/v1/bucket"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}"
+        }
+        response = requests.get(test_url, headers=headers, timeout=5)
+        health["supabase_connection"] = "ok" if response.status_code == 200 else f"error: {response.status_code}"
     except Exception as e:
-        health_status["supabase_connection"] = "error"
-        health_status["supabase_error"] = str(e)
+        health["supabase_connection"] = f"error: {str(e)}"
+        health["status"] = "degraded"
     
-    return health_status
+    return health
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_project(request: AnalysisRequest):
-    """Main endpoint to analyze a student project from Supabase storage"""
-    
-    logger.info(f"Received analysis request for project: {request.project_name}")
-    logger.info(f"Supabase path: {request.project_path}")
+    logger.info(f"Analysis request: {request.project_name}")
+    logger.info(f"Path: {request.project_path}")
     
     try:
         # Check cache
         cache_key = get_cache_key(request.project_path)
         if cache_key and cache_key in analysis_cache:
-            logger.info(f"Returning cached analysis for: {request.project_name}")
+            logger.info("Returning cached result")
             return analysis_cache[cache_key]
         
-        # Step 1: Download ZIP from Supabase
-        logger.info("Step 1: Downloading project from Supabase")
+        # Download from Supabase
+        logger.info("Step 1: Downloading from Supabase")
         zip_bytes = download_from_supabase(request.project_path)
         
-        # Step 2: Detect technology stack
-        logger.info("Step 2: Detecting technology stack")
+        # Detect tech stack
+        logger.info("Step 2: Detecting tech stack")
         tech_stack = detect_technology_stack(zip_bytes)
         
-        # Step 3: Read project files
-        logger.info("Step 3: Reading project files")
-        files_content = read_project_files_from_zip(zip_bytes)
+        # Read files
+        logger.info("Step 3: Reading files")
+        files_content = read_project_files(zip_bytes)
         
         if not files_content:
-            logger.error("No readable files found in project")
-            raise HTTPException(status_code=400, detail="No readable files found in project")
+            raise HTTPException(status_code=400, detail="No readable files found")
         
-        # Step 4: Analyze with OpenAI
-        logger.info("Step 4: Analyzing with AI")
-        ai_analysis = analyze_with_openai(
-            tech_stack=tech_stack,
-            files_content=files_content,
-            project_name=request.project_name,
-            student_description=request.student_description
+        # Analyze with AI
+        logger.info("Step 4: AI analysis")
+        ai_analysis = analyze_with_ai(
+            tech_stack, files_content,
+            request.project_name, request.student_description
         )
         
-        # Construct response
+        # Build response
         response = AnalysisResponse(
             project_name=request.project_name,
             student_description=request.student_description,
@@ -567,31 +497,27 @@ async def analyze_project(request: AnalysisRequest):
             analysis_timestamp=datetime.now().isoformat()
         )
         
-        # Cache the result
+        # Cache result
         if cache_key:
             analysis_cache[cache_key] = response
-            logger.info(f"Cached analysis result with key: {cache_key}")
         
-        logger.info(f"Analysis completed successfully for: {request.project_name}")
+        logger.info("Analysis completed successfully")
         return response
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Analysis failed: {str(e)}", exc_info=True)
+        logger.error(f"Analysis failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 @app.get("/cache/clear")
 async def clear_cache():
-    """Clear the analysis cache"""
-    cache_size = len(analysis_cache)
+    size = len(analysis_cache)
     analysis_cache.clear()
-    logger.info(f"Cache cleared. Removed {cache_size} entries")
-    return {"message": f"Cache cleared. Removed {cache_size} entries"}
+    return {"message": f"Cache cleared ({size} entries)"}
 
 @app.get("/cache/stats")
 async def cache_stats():
-    """Get cache statistics"""
     return {
         "cached_analyses": len(analysis_cache),
         "cache_keys": list(analysis_cache.keys())
@@ -601,7 +527,5 @@ if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", 8000))
-    
-    logger.info(f"Starting AI Analysis API on {host}:{port}")
-    logger.info(f"Using Supabase bucket: {SUPABASE_BUCKET}")
+    logger.info(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
