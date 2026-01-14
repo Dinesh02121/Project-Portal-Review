@@ -12,7 +12,8 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from zipfile import ZipFile
 from io import BytesIO
-
+import asyncio
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
@@ -27,10 +28,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Simple in-memory cache
+analysis_cache = {}
+
+# Environment configuration
+env = os.getenv("ENV", "development")
+
+# Lifespan context manager for startup/shutdown events
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle startup and shutdown events"""
+    # Startup
+    logger.info("=" * 60)
+    logger.info("AI Project Analysis API Starting...")
+    logger.info(f"Environment: {env}")
+    logger.info(f"Python Version: {os.sys.version}")
+    logger.info(f"Port: {os.getenv('PORT', '8000')}")
+    logger.info("=" * 60)
+    
+    yield
+    
+    # Shutdown
+    logger.info("AI Project Analysis API Shutting Down...")
+
+# Initialize FastAPI app
 app = FastAPI(
     title="AI Project Analysis API",
     description="Comprehensive code review and assessment using OpenAI",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS configuration
@@ -42,12 +68,10 @@ if not allowed_origins_str:
 else:
     allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
 
-# Only add wildcard in development (NOT in production)
-env = os.getenv("ENV", "development")
+# Only add wildcard in development
 if env == "development":
     allowed_origins.append("*")
 
-logger.info(f"Environment: {env}")
 logger.info(f"Allowed origins: {allowed_origins}")
 
 app.add_middleware(
@@ -77,9 +101,9 @@ else:
     client = OpenAI(api_key=api_key)
     MODEL_NAME = "gpt-4"
 
-# Simple in-memory cache
-analysis_cache = {}
+logger.info(f"Model configured: {MODEL_NAME}")
 
+# Pydantic models
 class AnalysisResponse(BaseModel):
     project_name: str
     student_description: str
@@ -92,6 +116,7 @@ class AnalysisResponse(BaseModel):
     weaknesses: List[str]
     analysis_timestamp: str
 
+# Helper functions
 def detect_technology_stack_from_bytes(zip_bytes: bytes) -> Dict[str, List[str]]:
     """Detect technologies from ZIP bytes"""
     tech_stack = {
@@ -409,7 +434,7 @@ IMPORTANT:
             logger.info(f"Analysis completed successfully with grade: {analysis.get('overall_grade')}")
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error: {e}")
-            logger.error(f"Response content: {content[:500]}")  # Log first 500 chars
+            logger.error(f"Response content: {content[:500]}")
             return get_default_analysis()
         
         # Validate required fields
@@ -430,9 +455,6 @@ IMPORTANT:
         
         return analysis
         
-    except TimeoutError:
-        logger.error("AI API request timed out")
-        return get_default_analysis()
     except Exception as e:
         logger.error(f"AI API error: {type(e).__name__}: {str(e)}", exc_info=True)
         return get_default_analysis()
@@ -473,6 +495,7 @@ def get_default_analysis() -> Dict:
         ]
     }
 
+# API Endpoints
 @app.get("/")
 async def root():
     """Root endpoint"""
@@ -481,8 +504,10 @@ async def root():
         "status": "active",
         "version": "1.0.0",
         "environment": env,
+        "model": MODEL_NAME,
         "endpoints": {
             "health": "/health",
+            "warmup": "/warmup",
             "analyze": "/analyze (POST - multipart/form-data)",
             "cache_clear": "/cache/clear",
             "cache_stats": "/cache/stats",
@@ -492,18 +517,23 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check endpoint"""
-    
-    health_status = {
+    """Lightweight health check for Render - responds quickly"""
+    return {
         "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/warmup")
+async def warmup():
+    """Warmup endpoint to pre-load the service"""
+    logger.info("Warmup request received")
+    return {
+        "status": "ready",
+        "message": "Service is warmed up and ready",
         "timestamp": datetime.now().isoformat(),
-        "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
-        "environment": os.getenv("ENV", "development"),
         "model": MODEL_NAME,
         "cache_size": len(analysis_cache)
     }
-    
-    return health_status
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_project(
@@ -639,12 +669,19 @@ async def cache_stats():
         "cache_keys": list(analysis_cache.keys())
     }
 
+# Entry point for running locally
 if __name__ == "__main__":
     import uvicorn
-    host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", 8000))
     
-    logger.info(f"Starting AI Analysis API on {host}:{port}")
+    logger.info(f"Starting AI Analysis API on 0.0.0.0:{port}")
     logger.info(f"Environment: {env}")
     logger.info(f"Model: {MODEL_NAME}")
-    uvicorn.run(app, host=host, port=port)
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info",
+        timeout_keep_alive=75
+    )
