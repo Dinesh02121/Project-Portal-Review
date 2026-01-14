@@ -3,9 +3,10 @@ services:
     name: ai-analysis-service
     env: python
     region: oregon
-    runtime: python  # Add this
-    buildCommand: "./build.sh"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 75
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
@@ -15,8 +16,3 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
-```
-
-**OR** create a `.python-version` file in your project root:
-```
-3.11.9
